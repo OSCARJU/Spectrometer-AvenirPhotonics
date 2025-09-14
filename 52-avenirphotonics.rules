@@ -1,0 +1,11 @@
+# udev rules file for Avenir Photonics spectrometers
+# ==================================================
+#
+# This file grants permission to access the devices on Linux.
+# Updated: 2024-11-26
+#
+
+# Aris spectrometer
+SUBSYSTEM=="usb", ATTR{idVendor}=="354f", ATTR{idProduct}=="0101", SYMLINK+="aris-%k", GROUP="users", MODE="0666"
+# Siena spectrometer
+SUBSYSTEM=="usb", ATTR{idVendor}=="354f", ATTR{idProduct}=="0104", SYMLINK+="siena-%k", GROUP="users", MODE="0666"
