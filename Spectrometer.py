@@ -34,6 +34,7 @@ import struct
 import time
 import traceback
 import threading
+from enum import Enum
 from json import dumps
 
 # Import your existing spectrometer classes
@@ -56,6 +57,26 @@ SpectrStatus = enum(
     SleepMode=0x09,
     NotConnected=0x0A
 )
+
+
+# Trigger modes according to ZioLink protocol
+class TriggerMode(Enum):
+    FREE_RUNNING_END = 0  # Trigger on end of exposure
+    FREE_RUNNING_START = 1  # Trigger on start of exposure
+    HARDWARE_TRIGGER = 2  # Hardware trigger
+
+
+# Trigger edge types
+class TriggerEdge(Enum):
+    RISING_EDGE = 0
+    FALLING_EDGE = 1
+
+
+# Acquisition modes
+class AcquisitionMode(Enum):
+    SINGLE = 0
+    CONTINUOUS = 1
+
 
 # PROTECTED REGION END #    //  SpectrometerCtrl.additional_import
 
@@ -164,8 +185,16 @@ class SpectrometerCtrl(Device):
             self._averaging = 1
             self._auto_exposure_enabled = False
             self._auto_exposure_time = 200  # ms
+            self._trigger_mode = TriggerMode.FREE_RUNNING_START
+            self._trigger_edge = TriggerEdge.RISING_EDGE
+            self._trigger_delay = 0.0  # ms
+            self._trigger_enabled = False
+            self._acquisition_mode = AcquisitionMode.SINGLE
             self._acquisition_running = False
             self._acquisition_thread = None
+
+            # Set default trigger configuration
+            self._configure_trigger()
 
             self._connected = True
             self.set_state(DevState.ON)
@@ -191,11 +220,43 @@ class SpectrometerCtrl(Device):
         self.set_status('Disconnected')
         self.info_stream("Device disconnected")
 
+    def _configure_trigger(self):
+        """Configure trigger settings using ZioLink protocol"""
+        if not self._connected:
+            return
+
+        try:
+            # Build TriggerInConfiguration value according to ZioLink protocol
+            # Byte 0: Trigger Mode, Byte 1: Trigger Edge, Bytes 2-3: reserved
+            trigger_config = (self._trigger_mode.value & 0xFF) | ((self._trigger_edge.value & 0xFF) << 8)
+
+            # Set TriggerInConfiguration parameter (0x1104)
+            self._ziolink.send_receive_message(0x1104, trigger_config)
+
+            # Set TriggerInDelay parameter (0x1105) in microseconds
+            self._ziolink.send_receive_message(0x1105, int(self._trigger_delay * 1000))
+
+            # Set TriggerInEnable parameter (0x1106)
+            self._ziolink.send_receive_message(0x1106, 1 if self._trigger_enabled else 0)
+
+            self.info_stream(
+                f"Trigger configured: Mode={self._trigger_mode.name}, Edge={self._trigger_edge.name}, Delay={self._trigger_delay}ms, Enabled={self._trigger_enabled}")
+
+        except Exception as e:
+            self.error_stream(f"Failed to configure trigger: {str(e)}")
+
     def _start_acquisition(self):
-        """Start continuous acquisition in a separate thread"""
+        """Start acquisition based on current mode"""
         if self._acquisition_running:
             return
 
+        if self._acquisition_mode == AcquisitionMode.CONTINUOUS:
+            self._start_continuous_acquisition()
+        else:
+            self._acquire_single_spectrum()
+
+    def _start_continuous_acquisition(self):
+        """Start continuous acquisition in a separate thread"""
         self._acquisition_running = True
         self._acquisition_thread = threading.Thread(target=self._acquisition_loop)
         self._acquisition_thread.daemon = True
@@ -207,7 +268,7 @@ class SpectrometerCtrl(Device):
         self._acquisition_running = False
         if self._acquisition_thread and self._acquisition_thread.is_alive():
             self._acquisition_thread.join(timeout=2.0)
-        self.info_stream("Continuous acquisition stopped")
+        self.info_stream("Acquisition stopped")
 
     def _acquisition_loop(self):
         """Continuous acquisition loop"""
@@ -235,8 +296,11 @@ class SpectrometerCtrl(Device):
                 self._ziolink.send_receive_message(0x110A,
                                                    int(self._auto_exposure_time * 1000))  # AutoExposureTime in microseconds
 
+            # Configure trigger
+            self._configure_trigger()
+
             # Start exposure
-            self._ziolink.send_receive_message(0x0004, 1)
+            self._ziolink.send_receive_message(0x0004, 1)  # Start exposure with 1 spectrum
 
             # Wait for exposure to complete
             status = SpectrStatus.TakingSpectrum
@@ -355,6 +419,44 @@ class SpectrometerCtrl(Device):
         display_level=DispLevel.OPERATOR
     )
 
+    TriggerMode = attribute(
+        dtype='int',
+        access=AttrWriteType.READ_WRITE,
+        doc="Trigger mode (0=FreeRunningEnd, 1=FreeRunningStart, 2=HardwareTrigger)",
+        display_level=DispLevel.OPERATOR
+    )
+
+    TriggerEdge = attribute(
+        dtype='int',
+        access=AttrWriteType.READ_WRITE,
+        doc="Trigger edge (0=RisingEdge, 1=FallingEdge)",
+        display_level=DispLevel.OPERATOR
+    )
+
+    TriggerDelay = attribute(
+        dtype='float',
+        access=AttrWriteType.READ_WRITE,
+        unit="ms",
+        min_value=0.0,
+        max_value=1000.0,
+        doc="Trigger delay in milliseconds",
+        display_level=DispLevel.OPERATOR
+    )
+
+    TriggerEnabled = attribute(
+        dtype='bool',
+        access=AttrWriteType.READ_WRITE,
+        doc="Enable or disable external triggering",
+        display_level=DispLevel.OPERATOR
+    )
+
+    AcquisitionMode = attribute(
+        dtype='int',
+        access=AttrWriteType.READ_WRITE,
+        doc="Acquisition mode (0=Single, 1=Continuous)",
+        display_level=DispLevel.OPERATOR
+    )
+
     Temperature = attribute(
         dtype='float',
         access=AttrWriteType.READ,
@@ -398,7 +500,7 @@ class SpectrometerCtrl(Device):
     AcquisitionRunning = attribute(
         dtype='bool',
         access=AttrWriteType.READ,
-        doc="True if continuous acquisition is running",
+        doc="True if acquisition is running",
         display_level=DispLevel.OPERATOR
     )
 
@@ -422,6 +524,11 @@ class SpectrometerCtrl(Device):
         self._averaging = 1
         self._auto_exposure_enabled = False
         self._auto_exposure_time = 200.0
+        self._trigger_mode = TriggerMode.FREE_RUNNING_START
+        self._trigger_edge = TriggerEdge.RISING_EDGE
+        self._trigger_delay = 0.0
+        self._trigger_enabled = False
+        self._acquisition_mode = AcquisitionMode.SINGLE
         self._load_level = 0.0
         self._temperature = 23.0
         self._acquisition_running = False
@@ -518,6 +625,64 @@ class SpectrometerCtrl(Device):
         self._auto_exposure_time = value
         self.info_stream(f"Auto exposure time set to {value} ms")
 
+    def read_TriggerMode(self):
+        return self._trigger_mode.value
+
+    def write_TriggerMode(self, value):
+        if not self._connected:
+            raise Exception("Device not connected")
+        try:
+            self._trigger_mode = TriggerMode(value)
+            self._configure_trigger()
+        except ValueError:
+            raise Exception(f"Invalid trigger mode: {value}")
+
+    def read_TriggerEdge(self):
+        return self._trigger_edge.value
+
+    def write_TriggerEdge(self, value):
+        if not self._connected:
+            raise Exception("Device not connected")
+        try:
+            self._trigger_edge = TriggerEdge(value)
+            self._configure_trigger()
+        except ValueError:
+            raise Exception(f"Invalid trigger edge: {value}")
+
+    def read_TriggerDelay(self):
+        return self._trigger_delay
+
+    def write_TriggerDelay(self, value):
+        if not self._connected:
+            raise Exception("Device not connected")
+        self._trigger_delay = value
+        self._configure_trigger()
+        self.info_stream(f"Trigger delay set to {value} ms")
+
+    def read_TriggerEnabled(self):
+        return self._trigger_enabled
+
+    def write_TriggerEnabled(self, value):
+        if not self._connected:
+            raise Exception("Device not connected")
+        self._trigger_enabled = value
+        self._configure_trigger()
+        status = "enabled" if value else "disabled"
+        self.info_stream(f"Trigger {status}")
+
+    def read_AcquisitionMode(self):
+        return self._acquisition_mode.value
+
+    def write_AcquisitionMode(self, value):
+        if not self._connected:
+            raise Exception("Device not connected")
+        try:
+            self._acquisition_mode = AcquisitionMode(value)
+            mode = "Single" if value == 0 else "Continuous"
+            self.info_stream(f"Acquisition mode set to {mode}")
+        except ValueError:
+            raise Exception(f"Invalid acquisition mode: {value}")
+
     def read_Temperature(self):
         return self._temperature
 
@@ -551,7 +716,9 @@ class SpectrometerCtrl(Device):
 
             status_str = status_map.get(status, f"Unknown ({status})")
             acquisition_status = "Running" if self._acquisition_running else "Stopped"
-            return f"Status: {status_str}, Available spectra: {available_spectra}, Acquisition: {acquisition_status}"
+            trigger_mode = self._trigger_mode.name
+            trigger_status = "Enabled" if self._trigger_enabled else "Disabled"
+            return f"Status: {status_str}, Available spectra: {available_spectra}, Acquisition: {acquisition_status}, Trigger: {trigger_mode} ({trigger_status})"
 
         except Exception as e:
             return f"Error reading status: {str(e)}"
@@ -583,6 +750,44 @@ class SpectrometerCtrl(Device):
 
     @command(
         dtype_in=None,
+        dtype_out=None,
+        doc_in="Reinitialize device connection"
+    )
+    @DebugIt()
+    def Reinitialize(self):
+        """Reinitialize the device connection"""
+        self.info_stream("Reinitializing device connection...")
+        try:
+            self._disconnect()
+            time.sleep(1.0)  # Brief delay
+            self._connect()
+            self.info_stream("Device reinitialized successfully")
+        except Exception as e:
+            self.error_stream(f"Reinitialization failed: {str(e)}")
+            raise
+
+    @command(
+        dtype_in=None,
+        dtype_out=None,
+        doc_in="Reset device to default settings"
+    )
+    @DebugIt()
+    def ResetDevice(self):
+        """Reset device to factory defaults"""
+        if not self._connected:
+            raise Exception("Device not connected")
+
+        try:
+            self._ziolink.send_receive_message(0x0000)  # Reset command
+            self.info_stream("Device reset to factory defaults")
+            time.sleep(2.0)  # Wait for reset to complete
+            self.Reinitialize()  # Reinitialize connection
+        except Exception as e:
+            self.error_stream(f"Device reset failed: {str(e)}")
+            raise
+
+    @command(
+        dtype_in=None,
         dtype_out='bool',
         doc_out="True if measurement was successful"
     )
@@ -608,26 +813,44 @@ class SpectrometerCtrl(Device):
     @command(
         dtype_in=None,
         dtype_out=None,
-        doc_in="Start continuous acquisition"
+        doc_in="Start acquisition (single or continuous based on mode)"
     )
     @DebugIt()
     def StartAcquisition(self):
-        """Start continuous acquisition"""
+        """Start acquisition based on current mode"""
         if not self._connected:
             raise Exception("Device not connected")
         self._start_acquisition()
-        self.info_stream("Continuous acquisition started")
 
     @command(
         dtype_in=None,
         dtype_out=None,
-        doc_in="Stop continuous acquisition"
+        doc_in="Stop acquisition"
     )
     @DebugIt()
     def StopAcquisition(self):
-        """Stop continuous acquisition"""
+        """Stop acquisition"""
         self._stop_acquisition()
-        self.info_stream("Continuous acquisition stopped")
+
+    @command(
+        dtype_in=None,
+        dtype_out=None,
+        doc_in="Send software trigger"
+    )
+    @DebugIt()
+    def SoftwareTrigger(self):
+        """Send software trigger command"""
+        if not self._connected:
+            raise Exception("Device not connected")
+
+        try:
+            # For software trigger, we use the standard exposure start command
+            # since software triggering is handled by starting the exposure
+            self._ziolink.send_receive_message(0x0004, 1)  # Start exposure with 1 spectrum
+            self.info_stream("Software trigger sent - starting exposure")
+        except Exception as e:
+            self.error_stream(f"Software trigger failed: {str(e)}")
+            raise
 
     @command(
         dtype_in='float',
@@ -664,6 +887,51 @@ class SpectrometerCtrl(Device):
     @DebugIt()
     def SetAutoExposureTime(self, exposure_time_ms):
         self.write_AutoExposureTime(exposure_time_ms)
+
+    @command(
+        dtype_in='int',
+        dtype_out=None,
+        doc_in="Trigger mode (0-2)"
+    )
+    @DebugIt()
+    def SetTriggerMode(self, trigger_mode):
+        self.write_TriggerMode(trigger_mode)
+
+    @command(
+        dtype_in='int',
+        dtype_out=None,
+        doc_in="Trigger edge (0-1)"
+    )
+    @DebugIt()
+    def SetTriggerEdge(self, trigger_edge):
+        self.write_TriggerEdge(trigger_edge)
+
+    @command(
+        dtype_in='float',
+        dtype_out=None,
+        doc_in="Trigger delay in milliseconds"
+    )
+    @DebugIt()
+    def SetTriggerDelay(self, delay_ms):
+        self.write_TriggerDelay(delay_ms)
+
+    @command(
+        dtype_in='bool',
+        dtype_out=None,
+        doc_in="Enable or disable external triggering"
+    )
+    @DebugIt()
+    def SetTriggerEnabled(self, enable):
+        self.write_TriggerEnabled(enable)
+
+    @command(
+        dtype_in='int',
+        dtype_out=None,
+        doc_in="Acquisition mode (0=Single, 1=Continuous)"
+    )
+    @DebugIt()
+    def SetAcquisitionMode(self, acquisition_mode):
+        self.write_AcquisitionMode(acquisition_mode)
 
     @command(
         dtype_in='DevString',
