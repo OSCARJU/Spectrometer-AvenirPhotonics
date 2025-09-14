@@ -36,6 +36,8 @@ import traceback
 import threading
 from enum import Enum
 from json import dumps
+import usb.core
+import usb.util
 
 # Import your existing spectrometer classes
 from libusb_interface import LibusbInterface
@@ -128,6 +130,19 @@ class SpectrometerCtrl(Device):
                 self.debug_stream('Secondary Exception: {}'.format(traceback.format_exc()))
                 raise ex
 
+    def _safe_get_serial_number(self, devpath):
+        """Safely get serial number from USB device with error handling"""
+        try:
+            # Try to get serial number with proper error handling
+            if hasattr(devpath, 'serial_number'):
+                serial = str(devpath.serial_number)
+                if serial and serial != 'None':
+                    return serial
+            return "Unknown"
+        except (ValueError, usb.core.USBError) as e:
+            self.debug_stream(f"Error getting serial number: {str(e)}")
+            return "Unknown"
+
     def _connect(self):
         """Connect to the spectrometer device via USB"""
         try:
@@ -137,18 +152,23 @@ class SpectrometerCtrl(Device):
             found_device = False
 
             for devpath in devpaths:
-                if devpath.idVendor == 0x354F and 0x0100 <= devpath.idProduct <= 0x01FF:
-                    # Check if this matches our serial number filter
-                    device_serial = str(devpath.serial_number)
-                    if self.SerialNumber and device_serial != self.SerialNumber:
-                        self.debug_stream(
-                            f"Skipping device with serial {device_serial} (looking for {self.SerialNumber})")
-                        continue
+                try:
+                    if devpath.idVendor == 0x354F and 0x0100 <= devpath.idProduct <= 0x01FF:
+                        # Check if this matches our serial number filter
+                        device_serial = self._safe_get_serial_number(devpath)
+                        if self.SerialNumber and device_serial != self.SerialNumber:
+                            self.debug_stream(
+                                f"Skipping device with serial {device_serial} (looking for {self.SerialNumber})")
+                            continue
 
-                    self._ziolink = ZioLinkProtocol(devpath)
-                    self.info_stream(f"Found {devpath.product} s/n: {device_serial}")
-                    found_device = True
-                    break
+                        self._ziolink = ZioLinkProtocol(devpath)
+                        product_name = getattr(devpath, 'product', 'Unknown Device')
+                        self.info_stream(f"Found {product_name} s/n: {device_serial}")
+                        found_device = True
+                        break
+                except (ValueError, usb.core.USBError) as e:
+                    self.debug_stream(f"Error examining USB device: {str(e)}")
+                    continue
 
             if not found_device:
                 raise Exception(f"No USB spectrometer device found. SerialNumber filter: '{self.SerialNumber}'")
@@ -158,25 +178,26 @@ class SpectrometerCtrl(Device):
 
             # Read device information
             model_name_bytes = self._ziolink.send_receive_message(0x2003)  # Get ModelName
-            if model_name_bytes[-1] == 0:
+            if model_name_bytes and model_name_bytes[-1] == 0:
                 model_name_bytes = model_name_bytes[:-1]  # strip trailing null terminator
-            self._model_name = str(model_name_bytes, "utf-8")
+            self._model_name = str(model_name_bytes, "utf-8") if model_name_bytes else "Unknown Model"
 
             serial_number_bytes = self._ziolink.send_receive_message(0x2001)  # Get SerialNumber
-            if serial_number_bytes[-1] == 0:
+            if serial_number_bytes and serial_number_bytes[-1] == 0:
                 serial_number_bytes = serial_number_bytes[:-1]  # strip trailing null terminator
-            self._serial_number = str(serial_number_bytes, "utf-8")
+            self._serial_number = str(serial_number_bytes, "utf-8") if serial_number_bytes else "Unknown"
 
             pixel_count_bytes = self._ziolink.send_receive_message(0x2007)  # Get PixelCount
-            self._pixel_count = int.from_bytes(pixel_count_bytes, 'little')
+            self._pixel_count = int.from_bytes(pixel_count_bytes, 'little') if pixel_count_bytes else 2048
 
             # Read wavelengths
-            c = [0] * 4
+            c = [0.0] * 4
             for i in range(0, 4):
                 wavelengths_bytes = self._ziolink.send_receive_message(0x201C + i)  # Get WavelengthCoeff
-                c[i] = struct.unpack('<f', wavelengths_bytes[0:4])[0]
+                if wavelengths_bytes and len(wavelengths_bytes) >= 4:
+                    c[i] = struct.unpack('<f', wavelengths_bytes[0:4])[0]
 
-            self._wavelengths = [0] * self._pixel_count
+            self._wavelengths = [0.0] * self._pixel_count
             for p in range(0, self._pixel_count):
                 self._wavelengths[p] = c[0] + (c[1] + (c[2] + c[3] * p) * p) * p
 
@@ -192,6 +213,7 @@ class SpectrometerCtrl(Device):
             self._acquisition_mode = AcquisitionMode.SINGLE
             self._acquisition_running = False
             self._acquisition_thread = None
+            self._last_acquisition_time = 0
 
             # Set default trigger configuration
             self._configure_trigger()
@@ -245,6 +267,38 @@ class SpectrometerCtrl(Device):
         except Exception as e:
             self.error_stream(f"Failed to configure trigger: {str(e)}")
 
+    def _force_usb_reset(self):
+        """Force USB port reset to recover from device lockup"""
+        try:
+            self.info_stream("Attempting USB port reset...")
+
+            # Find the device again
+            devpaths = LibusbInterface.find_interfaces()
+            for devpath in devpaths:
+                if (devpath.idVendor == 0x354F and
+                        0x0100 <= devpath.idProduct <= 0x01FF and
+                        self._safe_get_serial_number(devpath) == self.SerialNumber):
+
+                    # Try to reset the USB device
+                    try:
+                        devpath.reset()
+                        self.info_stream("USB device reset performed")
+                        time.sleep(3.0)  # Wait for device to re-enumerate
+                        return True
+                    except usb.core.USBError as e:
+                        self.warn_stream(f"USB reset failed: {str(e)}")
+                        # Try to physically disconnect/reconnect programmatically
+                        try:
+                            usb.util.dispose_resources(devpath)
+                        except:
+                            pass
+                        return False
+
+            return False
+        except Exception as e:
+            self.error_stream(f"USB reset procedure failed: {str(e)}")
+            return False
+
     def _start_acquisition(self):
         """Start acquisition based on current mode"""
         if self._acquisition_running:
@@ -256,7 +310,20 @@ class SpectrometerCtrl(Device):
             self._acquire_single_spectrum()
 
     def _start_continuous_acquisition(self):
-        """Start continuous acquisition in a separate thread"""
+        """Start continuous acquisition with safety checks"""
+        if self._acquisition_running:
+            return
+
+        # Safety check: don't allow very short exposure times in continuous mode
+        if self._exposure_time < 5.0 and self._acquisition_mode == AcquisitionMode.CONTINUOUS:
+            self.warn_stream("Very short exposure time in continuous mode may cause device issues")
+            self._exposure_time = max(self._exposure_time, 5.0)
+
+        # Limit maximum continuous acquisition rate
+        if self._exposure_time < 20.0:
+            self.info_stream("Adding safety delay for short exposure continuous acquisition")
+            time.sleep(1.0)
+
         self._acquisition_running = True
         self._acquisition_thread = threading.Thread(target=self._acquisition_loop)
         self._acquisition_thread.daemon = True
@@ -271,18 +338,78 @@ class SpectrometerCtrl(Device):
         self.info_stream("Acquisition stopped")
 
     def _acquisition_loop(self):
-        """Continuous acquisition loop"""
-        while self._acquisition_running and self._connected:
+        """Continuous acquisition loop with robust error handling and watchdog timer"""
+        acquisition_errors = 0
+        max_errors = 5
+        watchdog_timeout = 10.0  # 10 second watchdog
+
+        while self._acquisition_running:
+            watchdog_start = time.time()
+
             try:
-                self._acquire_single_spectrum()
+                if not self._connected:
+                    self.warn_stream("Device disconnected during acquisition, attempting reconnect...")
+                    self.Reinitialize()
+                    if not self._connected:
+                        time.sleep(2.0)
+                        continue
+
+                # Rate limiting for continuous acquisition
+                current_time = time.time()
+                if current_time - self._last_acquisition_time < 0.1:  # 10Hz max
+                    time.sleep(0.05)
+                    continue
+
+                success = self._acquire_single_spectrum()
+                self._last_acquisition_time = current_time
+
+                if success:
+                    acquisition_errors = 0  # Reset error counter on success
+                    watchdog_start = time.time()  # Reset watchdog on successful acquisition
+                else:
+                    acquisition_errors += 1
+                    if acquisition_errors >= max_errors:
+                        self.error_stream("Too many acquisition errors, stopping acquisition")
+                        break
+
                 # Small delay to prevent overwhelming the device
                 time.sleep(0.1)
+
+            except (usb.core.USBError, ConnectionError) as e:
+                # Check if watchdog expired
+                if time.time() - watchdog_start > watchdog_timeout:
+                    self.error_stream("Watchdog timeout detected - device may be hung")
+                    acquisition_errors = max_errors  # Force exit
+
+                self.error_stream(f"USB connection error during acquisition: {str(e)}")
+                acquisition_errors += 1
+                self._connected = False
+                self.set_state(DevState.FAULT)
+                self.set_status('USB connection lost')
+
+                if acquisition_errors >= max_errors:
+                    self.error_stream("Too many USB errors, stopping acquisition")
+                    break
+                time.sleep(2.0)  # Wait before retrying
+
             except Exception as e:
-                self.error_stream(f"Acquisition error: {str(e)}")
+                # Check if watchdog expired
+                if time.time() - watchdog_start > watchdog_timeout:
+                    self.error_stream("Watchdog timeout detected - device may be hung")
+                    acquisition_errors = max_errors  # Force exit
+
+                self.error_stream(f"Unexpected error during acquisition: {str(e)}")
+                acquisition_errors += 1
+                if acquisition_errors >= max_errors:
+                    self.error_stream("Too many unexpected errors, stopping acquisition")
+                    break
                 time.sleep(1.0)  # Wait before retrying
 
+        self._acquisition_running = False
+        self.info_stream("Continuous acquisition stopped")
+
     def _acquire_single_spectrum(self):
-        """Acquire a single spectrum"""
+        """Acquire a single spectrum with robust error handling"""
         if not self._connected:
             return False
 
@@ -336,8 +463,50 @@ class SpectrometerCtrl(Device):
 
             return True
 
+        except (usb.core.USBError, ConnectionError) as e:
+            self.error_stream(f"USB error during spectrum acquisition: {str(e)}")
+            self._connected = False
+            self.set_state(DevState.FAULT)
+            self.set_status('USB connection error')
+            return False
+
         except Exception as e:
             self.error_stream(f"Spectrum acquisition failed: {str(e)}")
+            return False
+
+    def _try_graceful_recovery(self):
+        """Try graceful recovery strategy"""
+        try:
+            self.Reinitialize()
+            return True
+        except:
+            return False
+
+    def _try_usb_reset(self):
+        """Try USB reset strategy"""
+        try:
+            return self._force_usb_reset()
+        except:
+            return False
+
+    def _try_delayed_reconnect(self):
+        """Try delayed reconnect strategy"""
+        try:
+            self._disconnect()
+            time.sleep(10.0)  # Long delay
+            self._connect()
+            return True
+        except:
+            return False
+
+    def _try_full_reset(self):
+        """Try full reset strategy (platform-specific)"""
+        try:
+            # Platform-specific USB reset code could be added here
+            # For Linux: usb_reset.py or similar
+            self.info_stream("Full reset strategy not implemented for this platform")
+            return False
+        except:
             return False
 
     # PROTECTED REGION END #    //  SpectrometerCtrl.class_variable
@@ -533,6 +702,7 @@ class SpectrometerCtrl(Device):
         self._temperature = 23.0
         self._acquisition_running = False
         self._acquisition_thread = None
+        self._last_acquisition_time = 0
 
         try:
             if self.AutoConnect:
@@ -750,21 +920,42 @@ class SpectrometerCtrl(Device):
 
     @command(
         dtype_in=None,
-        dtype_out=None,
-        doc_in="Reinitialize device connection"
+        dtype_out='bool',
+        doc_in="Reinitialize device connection with timeout handling"
     )
     @DebugIt()
     def Reinitialize(self):
-        """Reinitialize the device connection"""
+        """Reinitialize the device connection with robust error handling"""
         self.info_stream("Reinitializing device connection...")
+
+        # First try graceful disconnect
         try:
+            self._stop_acquisition()
             self._disconnect()
-            time.sleep(1.0)  # Brief delay
+        except:
+            pass  # Ignore errors during disconnect
+
+        # Wait and try USB reset if needed
+        time.sleep(3.0)
+
+        # Attempt USB reset if device was previously connected
+        if self._ziolink and hasattr(self._ziolink, '_device'):
+            try:
+                self._force_usb_reset()
+                time.sleep(5.0)  # Longer wait after reset
+            except:
+                pass
+
+        # Try to reconnect
+        try:
             self._connect()
             self.info_stream("Device reinitialized successfully")
+            return True
         except Exception as e:
             self.error_stream(f"Reinitialization failed: {str(e)}")
-            raise
+            self.set_state(DevState.FAULT)
+            self.set_status('Reinitialization failed')
+            return False
 
     @command(
         dtype_in=None,
@@ -780,7 +971,7 @@ class SpectrometerCtrl(Device):
         try:
             self._ziolink.send_receive_message(0x0000)  # Reset command
             self.info_stream("Device reset to factory defaults")
-            time.sleep(2.0)  # Wait for reset to complete
+            time.sleep(3.0)  # Longer wait for reset to complete
             self.Reinitialize()  # Reinitialize connection
         except Exception as e:
             self.error_stream(f"Device reset failed: {str(e)}")
@@ -853,111 +1044,49 @@ class SpectrometerCtrl(Device):
             raise
 
     @command(
-        dtype_in='float',
-        dtype_out=None,
-        doc_in="Exposure time in milliseconds"
+        dtype_in=None,
+        dtype_out='bool',
+        doc_in="Force USB reset to recover from device lockup"
     )
     @DebugIt()
-    def SetExposureTime(self, exposure_time_ms):
-        self.write_ExposureTime(exposure_time_ms)
+    def ForceUSBReset(self):
+        """Force USB reset to recover unresponsive device"""
+        success = self._force_usb_reset()
+        if success:
+            time.sleep(5.0)  # Wait for device to be ready
+            try:
+                self.Reinitialize()
+                return True
+            except:
+                return False
+        return False
 
     @command(
-        dtype_in='int',
-        dtype_out=None,
-        doc_in="Number of spectra to average"
+        dtype_in=None,
+        dtype_out='bool',
+        doc_in="Emergency recovery for unresponsive device"
     )
     @DebugIt()
-    def SetAveraging(self, averaging_count):
-        self.write_Averaging(averaging_count)
+    def EmergencyRecovery(self):
+        """Try multiple strategies to recover unresponsive device"""
+        self.info_stream("Starting emergency recovery procedure...")
 
-    @command(
-        dtype_in='bool',
-        dtype_out=None,
-        doc_in="True to enable auto exposure"
-    )
-    @DebugIt()
-    def SetAutoExposure(self, enable):
-        self.write_AutoExposureEnabled(enable)
+        strategies = [
+            self._try_graceful_recovery,
+            self._try_usb_reset,
+            self._try_delayed_reconnect,
+            self._try_full_reset
+        ]
 
-    @command(
-        dtype_in='float',
-        dtype_out=None,
-        doc_in="Auto exposure time in milliseconds"
-    )
-    @DebugIt()
-    def SetAutoExposureTime(self, exposure_time_ms):
-        self.write_AutoExposureTime(exposure_time_ms)
+        for i, strategy in enumerate(strategies):
+            self.info_stream(f"Trying recovery strategy {i + 1}...")
+            if strategy():
+                self.info_stream("Recovery successful!")
+                return True
+            time.sleep(2.0)
 
-    @command(
-        dtype_in='int',
-        dtype_out=None,
-        doc_in="Trigger mode (0-2)"
-    )
-    @DebugIt()
-    def SetTriggerMode(self, trigger_mode):
-        self.write_TriggerMode(trigger_mode)
-
-    @command(
-        dtype_in='int',
-        dtype_out=None,
-        doc_in="Trigger edge (0-1)"
-    )
-    @DebugIt()
-    def SetTriggerEdge(self, trigger_edge):
-        self.write_TriggerEdge(trigger_edge)
-
-    @command(
-        dtype_in='float',
-        dtype_out=None,
-        doc_in="Trigger delay in milliseconds"
-    )
-    @DebugIt()
-    def SetTriggerDelay(self, delay_ms):
-        self.write_TriggerDelay(delay_ms)
-
-    @command(
-        dtype_in='bool',
-        dtype_out=None,
-        doc_in="Enable or disable external triggering"
-    )
-    @DebugIt()
-    def SetTriggerEnabled(self, enable):
-        self.write_TriggerEnabled(enable)
-
-    @command(
-        dtype_in='int',
-        dtype_out=None,
-        doc_in="Acquisition mode (0=Single, 1=Continuous)"
-    )
-    @DebugIt()
-    def SetAcquisitionMode(self, acquisition_mode):
-        self.write_AcquisitionMode(acquisition_mode)
-
-    @command(
-        dtype_in='DevString',
-        dtype_out='DevString',
-        doc_in="ZioLink command to send",
-        doc_out="Response from device"
-    )
-    @DebugIt()
-    def SendZioLinkCommand(self, argin):
-        if not self._connected:
-            raise Exception("Device not connected")
-
-        try:
-            if '=' in argin:
-                cmd_str, param_str = argin.split('=', 1)
-                cmd = int(cmd_str, 0)
-                param = int(param_str)
-                response = self._ziolink.send_receive_message(cmd, param)
-            else:
-                cmd = int(argin, 0)
-                response = self._ziolink.send_receive_message(cmd)
-
-            return f"Command 0x{cmd:04X}: {response.hex()}"
-
-        except Exception as e:
-            raise Exception(f"Failed to send ZioLink command: {str(e)}")
+        self.error_stream("All recovery strategies failed")
+        return False
 
 
 # ----------
